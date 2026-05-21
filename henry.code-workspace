@@ -1,0 +1,14 @@
+{
+  "folders": [
+    { "path": "." },
+    { "path": "Clase1" },
+    { "path": "Clase2" },
+    { "path": "Clase3" },
+    { "path": "Clase4" }
+  ],
+  "settings": {
+    "python.venvFolders": [".venv"],
+    "jupyter.kernels.excludePythonEnvironments": [],
+    "python.terminal.activateEnvInCurrentTerminal": true
+  }
+}
