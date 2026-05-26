@@ -98,78 +98,25 @@ Santana y al de los Cadillacs. Si no se cumple, deberíamos verlo. Empecemos.
         """
 ## 2. Setup
 
-### 2.1 Kernel correcto
-
-> **Antes de ejecutar cualquier celda:** verifica arriba a la derecha que el
-> kernel diga **"Python (Clase 3 · RAG)"** (`clase3-henry`). Si ves "Python 3"
-> genérico o algo distinto, cámbialo desde el menú *Kernel → Change Kernel*.
->
-> Si el kernel `clase3-henry` no aparece en la lista, registralo una vez:
->
+> **Kernel:** arriba a la derecha debe decir **"Python (Clase 3 · RAG)"**
+> (`clase3-henry`). Si no aparece, registralo con:
 > ```bash
 > cd Clase3
 > uv run python -m ipykernel install --user --name=clase3-henry --display-name="Python (Clase 3 · RAG)"
 > ```
 
-### 2.2 Por qué reutilizamos código de `src/clase3/`
+El paquete `clase3` ya está instalado en este venv vía `uv sync` (modo
+editable, configurado por `pyproject.toml`). Eso significa que podemos
+importar directamente — no hay que tocar `sys.path` ni descubrir rutas.
+Toda la lógica que usa el RAG en producción se carga tal cual.
 
-La notebook **no** reimplementa embeddings ni loaders: usa el mismo
-`OpenAIEmbedder` y `MarkdownDirectoryLoader` que usa el RAG en producción.
-Eso garantiza que lo que ves aquí es **exactamente** lo que está pasando
-dentro de tu pipeline.
+Las claves de API se leen de `HENRY_EMBEDDINGS_RAGS/.env`:
 
-La siguiente celda hace dos cosas:
+- `OPENAI_API_KEY`   (obligatoria — modelos `text-embedding-3-small/large`)
+- `GCP_API_KEY`      (opcional — modelos `text-embedding-004`, `gemini-embedding-001`)
 
-1. Descubre la raíz del proyecto (busca `pyproject.toml` hacia arriba) y mete
-   `src/` en `sys.path`. Esto permite que la notebook funcione **aunque el
-   kernel no tenga `clase3` instalado como paquete** (útil para Colab o
-   kernels limpios).
-2. Importa las piezas que vamos a usar.
-        """
-    ),
-    code(
-        """
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-
-def _find_project_root(start: Path) -> Path:
-    \"\"\"Sube por el árbol buscando el pyproject.toml de Clase3.\"\"\"
-    for candidate in [start, *start.parents]:
-        if (candidate / "pyproject.toml").exists() and (candidate / "src" / "clase3").exists():
-            return candidate
-    raise RuntimeError(
-        "No se encontró la raíz de Clase3. Abre la notebook desde dentro "
-        "de Clase3/notebooks/ o ejecuta `cd Clase3` antes de iniciar Jupyter."
-    )
-
-
-_HERE = Path.cwd().resolve()
-PROJECT_ROOT = _find_project_root(_HERE)
-SRC_PATH = PROJECT_ROOT / "src"
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
-# Verificación temprana: importar y cargar .env
-try:
-    import importlib.util
-
-    from clase3.config import OPENAI_API_KEY
-
-    spec = importlib.util.find_spec("clase3")
-    location = spec.origin if spec else "?"
-    print(f"PROJECT_ROOT  = {PROJECT_ROOT}")
-    print(f"clase3 desde  = {location}")
-    print(f"OPENAI_API_KEY cargado: {bool(OPENAI_API_KEY)}")
-    print("\\n✓ Setup OK. Listo para ejecutar las siguientes celdas.")
-except ModuleNotFoundError as exc:
-    raise RuntimeError(
-        "No se pudo importar 'clase3'. Asegúrate de:\\n"
-        f"  1) Haber corrido `uv sync` en {PROJECT_ROOT}\\n"
-        "  2) Haber seleccionado el kernel 'Python (Clase 3 · RAG)' arriba a la derecha."
-    ) from exc
+Si una clave falta, los modelos asociados se saltan automáticamente y la
+notebook sigue funcionando con los que sí están disponibles.
         """
     ),
     code(
@@ -183,9 +130,8 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-from clase3.adapters.markdown_loader import MarkdownDirectoryLoader
-from clase3.adapters.openai_embedder import OpenAIEmbedder
-from clase3.config import MUSIC_DIR, OPENAI_API_KEY
+from clase3.adapters import GoogleGenAIEmbedder, MarkdownDirectoryLoader, OpenAIEmbedder
+from clase3.config import GCP_API_KEY, MUSIC_DIR, OPENAI_API_KEY, PROJECT_ROOT
 from clase3.services.chunker import TextChunker
 
 %matplotlib inline
@@ -195,10 +141,9 @@ plt.rcParams["grid.alpha"] = 0.25
 plt.rcParams["axes.spines.top"] = False
 plt.rcParams["axes.spines.right"] = False
 
-# Cache de embeddings (idempotente: la clave es sha256 del texto)
-CACHE_PATH = PROJECT_ROOT / ".cache" / "music_embeddings.pkl"
-CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-print(f"Cache de embeddings: {CACHE_PATH.relative_to(PROJECT_ROOT)}")
+print(f"PROJECT_ROOT:          {PROJECT_ROOT}")
+print(f"OPENAI_API_KEY:        {'✓ cargada' if OPENAI_API_KEY else '✘ falta'}")
+print(f"GCP_API_KEY:           {'✓ cargada' if GCP_API_KEY else '✘ falta (modelos Google se saltarán)'}")
         """
     ),
     md(
@@ -249,52 +194,78 @@ for c in corpus:
     ),
     md(
         """
-## 4. Generar embeddings (con cache)
+## 4. Generar embeddings — un cache que sabe de qué modelo viene cada vector
 
-Cada llamada a la API de OpenAI cuesta tiempo y dinero. Para una notebook que
-vamos a re-ejecutar muchas veces, cacheamos los vectores en disco. La clave es
-el **sha256 del texto** — si tocas una canción, su embedding se recalcula
-automáticamente; si no, se reutiliza.
+Cada llamada a una API cuesta tiempo y dinero. Para una notebook que se
+re-ejecuta muchas veces, cacheamos en disco. La clave del cache combina
+**(modelo, texto)** porque más adelante vamos a comparar varios modelos sobre
+el mismo corpus; si la clave fuera sólo el texto, mezclaríamos vectores de
+distintos modelos.
 
-Una idea importante: **el embedder es determinístico para un input dado**. Eso
-nos permite tratar al cache como una memoización pura. (No es 100% verdad en
-APIs con flotantes y batching, pero la varianza es despreciable para nuestros
-fines).
+El cache es una memoización pura: el embedder es determinístico para un input
+dado (no es 100% verdad por la aritmética de flotantes y el batching, pero la
+varianza es despreciable para nuestros fines).
+
+Para esta primera sección usamos `text-embedding-3-small` como modelo
+*default* (el que usa el RAG en producción). Más abajo lo compararemos con
+otros tres modelos.
         """
     ),
     code(
         """
-def _key(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+CACHE_PATH = PROJECT_ROOT / ".cache" / "music_embeddings.pkl"
+CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-def load_or_compute_embeddings(items: list[dict]) -> np.ndarray:
-    cache: dict[str, list[float]] = {}
-    if CACHE_PATH.exists():
-        with CACHE_PATH.open("rb") as f:
-            cache = pickle.load(f)
+def _cache_key(model: str, text: str) -> str:
+    return hashlib.sha256(f"{model}|{text}".encode("utf-8")).hexdigest()
 
-    pending = [it for it in items if _key(it["text"]) not in cache]
+
+def _load_cache() -> dict[str, list[float]]:
+    if not CACHE_PATH.exists():
+        return {}
+    with CACHE_PATH.open("rb") as f:
+        return pickle.load(f)
+
+
+def _save_cache(cache: dict[str, list[float]]) -> None:
+    with CACHE_PATH.open("wb") as f:
+        pickle.dump(cache, f)
+
+
+def embed_corpus(model_name: str, embedder, items: list[dict]) -> np.ndarray:
+    \"\"\"Devuelve la matriz (N, d) de embeddings de `items` usando `embedder`.
+
+    Cachea por (modelo, texto). Si todos los vectores están en cache,
+    no llama a la API.
+    \"\"\"
+    cache = _load_cache()
+    pending = [it for it in items if _cache_key(model_name, it["text"]) not in cache]
     if pending:
-        print(f"  Calculando {len(pending)} embeddings nuevos vía OpenAI...")
-        embedder = OpenAIEmbedder(model="text-embedding-3-small", api_key=OPENAI_API_KEY)
+        print(f"  [{model_name}] calculando {len(pending)} embeddings vía API...")
         vectors = embedder.embed([it["text"] for it in pending])
         for item, vec in zip(pending, vectors, strict=True):
-            cache[_key(item["text"])] = vec
-        with CACHE_PATH.open("wb") as f:
-            pickle.dump(cache, f)
-        print(f"  Cache actualizado. Total en disco: {len(cache)} vectores.")
+            cache[_cache_key(model_name, item["text"])] = vec
+        _save_cache(cache)
+        print(f"  [{model_name}] cache actualizado. Vectores en disco: {len(cache)}.")
     else:
-        print(f"  Cache HIT para las {len(items)} canciones. Sin llamadas a la API.")
-    return np.array([cache[_key(it["text"])] for it in items], dtype=np.float32)
+        print(f"  [{model_name}] cache HIT para las {len(items)} canciones.")
+    return np.array(
+        [cache[_cache_key(model_name, it["text"])] for it in items],
+        dtype=np.float32,
+    )
 
 
-X = load_or_compute_embeddings(corpus)
+# Embedder default: el mismo que usa el RAG en producción
+DEFAULT_MODEL = "text-embedding-3-small"
+default_embedder = OpenAIEmbedder(model=DEFAULT_MODEL, api_key=OPENAI_API_KEY)
+
+X = embed_corpus(DEFAULT_MODEL, default_embedder, corpus)
 labels = [c["title"] for c in corpus]
 artists = [c["artist"] for c in corpus]
 
-print(f"\\nMatriz X: shape={X.shape}, dtype={X.dtype}")
-print(f"Espacio en disco para X: ~{X.nbytes / 1024:.1f} KB")
+print(f"\\nMatriz X: shape={X.shape}, dtype={X.dtype}, modelo='{DEFAULT_MODEL}'")
+print(f"Espacio en disco: ~{X.nbytes / 1024:.1f} KB")
         """
     ),
     md(
@@ -734,7 +705,7 @@ chunk_items = [
     }
     for c in target_chunks
 ]
-X_chunks = load_or_compute_embeddings(chunk_items)
+X_chunks = embed_corpus(DEFAULT_MODEL, default_embedder, chunk_items)
 
 print(f"Quimbara se troceó en {len(target_chunks)} chunks:")
 for c in target_chunks:
@@ -815,7 +786,462 @@ párrafo exacto que responde lo que preguntaste".
     ),
     md(
         """
-## 12. Cierre — la caja de herramientas que te llevas
+## 12. Comparación profunda — cuatro modelos, mismo corpus
+
+Hasta aquí todo lo vimos con un solo modelo: `text-embedding-3-small`. Ahora
+viene la pregunta operativa: **¿qué pasa si cambias de modelo?** Comparamos:
+
+| Modelo | Proveedor | Dim. | Costo/1M tokens (ref.) |
+|--------|-----------|-----:|------------------------:|
+| `text-embedding-3-small`  | OpenAI | 1536 | $0.02  |
+| `text-embedding-3-large`  | OpenAI | 3072 | $0.13  |
+| `gemini-embedding-001`    | Google | 3072 | gratis hasta cierto QPS |
+| `gemini-embedding-2`      | Google | 3072 | gratis hasta cierto QPS |
+
+**Notas sobre la familia Google:**
+
+- `text-embedding-004` fue **deprecado** del API pública de AI Studio (404
+  al llamarlo). Por eso lo reemplazamos con `gemini-embedding-2`, que es
+  el sucesor lógico en la línea evolutiva de Google.
+- `text-embedding-005` sólo se expone vía **Vertex AI**, que requiere
+  credenciales GCP (ADC o service account), no una API key plana. Para una
+  notebook portable lo dejamos fuera.
+- `gemini-embedding-001` vs `gemini-embedding-2`: ambos tienen la misma
+  dimensión (3072), pero la generación 2 trae mejoras en multilingual y
+  task-conditioning. La comparación lado-a-lado te muestra cuánto cambian
+  en la práctica.
+
+**Preguntas que vamos a responder con datos:**
+
+1. ¿Qué tan bien **separa por artista** cada modelo? (silhouette, ratio
+   intra/inter)
+2. ¿Cuántas dimensiones realmente "se usan"? (varianza explicada por PCA)
+3. ¿Quién acierta más en **retrieval real** con queries que un usuario
+   escribiría?
+4. ¿Vale la pena pagar 6.5x más por el `large`?
+
+### Por qué no es comparación injusta
+
+Para que la comparación tenga sentido evitamos dos trampas:
+
+- **No reentrenamos nada.** Cada modelo trabaja con sus pesos pre-entrenados;
+  no le damos ventaja a ninguno con fine-tuning.
+- **Mismo input, misma query.** El texto que entra a la API es idéntico para
+  todos. Las diferencias que veamos son del modelo, no del preprocesamiento.
+
+Eso sí — algo a tener presente: los modelos están entrenados con corpora muy
+distintos. Si tu corpus es muy especializado (códigos médicos, idioma local
+poco representado), un benchmark "general" puede no ser predictivo de tu
+caso. Aquí nuestro corpus es texto cultural en español neutro — algo bien
+cubierto por los cuatro modelos.
+        """
+    ),
+    code(
+        """
+# Definimos los modelos a comparar. Si una API key falta o falla,
+# el modelo se salta con un mensaje claro y la comparación sigue.
+MODELS_TO_COMPARE = [
+    ("text-embedding-3-small",  "OpenAI · small",     "openai"),
+    ("text-embedding-3-large",  "OpenAI · large",     "openai"),
+    ("gemini-embedding-001",    "Google · gemini-1",  "google"),
+    ("gemini-embedding-2",      "Google · gemini-2",  "google"),
+]
+
+
+def build_embedder(model_name: str, vendor: str):
+    if vendor == "openai":
+        if not OPENAI_API_KEY:
+            return None, "OPENAI_API_KEY no configurada"
+        return OpenAIEmbedder(model=model_name, api_key=OPENAI_API_KEY), None
+    if vendor == "google":
+        if not GCP_API_KEY:
+            return None, "GCP_API_KEY no configurada"
+        return GoogleGenAIEmbedder(model=model_name, api_key=GCP_API_KEY), None
+    return None, f"vendor desconocido: {vendor}"
+
+
+# Llamamos a cada modelo (cacheado). Guardamos en `model_results` lo que
+# funcionó; lo que falla queda registrado en `model_failures`.
+model_results: dict[str, dict] = {}
+model_failures: list[tuple[str, str]] = []
+
+for model_name, pretty_name, vendor in MODELS_TO_COMPARE:
+    embedder, err = build_embedder(model_name, vendor)
+    if embedder is None:
+        print(f"  ⏭  saltando {pretty_name}: {err}")
+        model_failures.append((pretty_name, err))
+        continue
+    try:
+        X_m = embed_corpus(model_name, embedder, corpus)
+        # Normalizamos para que el producto punto sea similitud coseno
+        norms = np.linalg.norm(X_m, axis=1, keepdims=True)
+        X_m_norm = X_m / np.where(norms == 0, 1, norms)
+        model_results[pretty_name] = {
+            "name": pretty_name,
+            "model_id": model_name,
+            "vendor": vendor,
+            "X": X_m_norm,
+            "dim": X_m.shape[1],
+        }
+        print(f"  ✓ {pretty_name}: shape={X_m.shape}")
+    except Exception as exc:  # noqa: BLE001 — capturamos cualquier fallo de red/API
+        msg = type(exc).__name__ + ": " + str(exc).split(chr(10))[0][:120]
+        print(f"  ✘ {pretty_name} falló — {msg}")
+        model_failures.append((pretty_name, msg))
+
+print(f"\\nModelos disponibles para comparar: {len(model_results)} / {len(MODELS_TO_COMPARE)}")
+        """
+    ),
+    md(
+        """
+### 12.1 Métricas de separación — ¿qué tan bien agrupa cada modelo?
+
+Tres métricas sobre el mismo dato:
+
+- **`sim_intra`** (similitud intra-artista): promedio del coseno entre canciones
+  *del mismo* artista. Alto = el modelo cree que las canciones de Celia se
+  parecen entre sí.
+- **`sim_inter`** (similitud inter-artista): promedio entre canciones de
+  artistas *distintos*. Bajo = el modelo separa estilos.
+- **`gap`** = `sim_intra − sim_inter`. Es lo que más nos importa: el espacio
+  entre el "interior" del cluster y su "exterior". Más grande = clusters más
+  apretados y separados.
+
+Adicionalmente, **silhouette score** es la métrica canónica para clustering:
+combina cohesión (qué tan cerca está cada punto de los suyos) y separación
+(qué tan lejos de los ajenos), normalizada a [-1, 1]. Mayor = mejor.
+        """
+    ),
+    code(
+        """
+from sklearn.metrics import silhouette_score
+
+
+def compute_separation_metrics(X_norm: np.ndarray, artists: list[str]) -> dict:
+    sim = X_norm @ X_norm.T
+    n = len(artists)
+    intra_vals, inter_vals = [], []
+    for i in range(n):
+        for j in range(i + 1, n):
+            (intra_vals if artists[i] == artists[j] else inter_vals).append(sim[i, j])
+    sim_intra = float(np.mean(intra_vals)) if intra_vals else float("nan")
+    sim_inter = float(np.mean(inter_vals)) if inter_vals else float("nan")
+    # Silhouette necesita una distancia (1 - sim) y al menos 2 clusters con ≥2 puntos
+    distance = 1.0 - sim
+    np.fill_diagonal(distance, 0.0)
+    sil = float(silhouette_score(distance, artists, metric="precomputed"))
+    # PCA explained variance (info que vive en 2 dims)
+    pca = PCA(n_components=2).fit(X_norm)
+    return {
+        "sim_intra": sim_intra,
+        "sim_inter": sim_inter,
+        "gap": sim_intra - sim_inter,
+        "silhouette": sil,
+        "pca_var": float(pca.explained_variance_ratio_.sum()),
+    }
+
+
+for name, info in model_results.items():
+    info["metrics"] = compute_separation_metrics(info["X"], artists)
+
+# Imprimimos la tabla
+print(f"{'Modelo':<22}  {'dim':>4}  {'intra':>7}  {'inter':>7}  {'gap':>7}  {'silh':>6}  {'PCA-var':>7}")
+print("─" * 78)
+for name, info in model_results.items():
+    m = info["metrics"]
+    print(
+        f"{name:<22}  {info['dim']:>4}  "
+        f"{m['sim_intra']:>7.3f}  {m['sim_inter']:>7.3f}  {m['gap']:>+7.3f}  "
+        f"{m['silhouette']:>+6.3f}  {m['pca_var']:>6.1%}"
+    )
+        """
+    ),
+    md(
+        """
+### 12.2 Visualización lado a lado — el mismo corpus, cuatro mapas
+
+Ahora vemos los cuatro mapas con PCA. Misma escala, mismos colores. Una
+imagen vale 1536 dimensiones.
+        """
+    ),
+    code(
+        """
+ARTIST_COLORS_CMP = {
+    "Santana": "#1f77b4",
+    "Celia Cruz": "#d62728",
+    "Cadillacs": "#2ca02c",
+}
+
+n_models = len(model_results)
+ncols = min(n_models, 2)
+nrows = (n_models + ncols - 1) // ncols
+fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 6 * nrows), squeeze=False)
+axes = axes.flatten()
+
+for ax_idx, (name, info) in enumerate(model_results.items()):
+    ax = axes[ax_idx]
+    pca = PCA(n_components=2)
+    P = pca.fit_transform(info["X"])
+    for i, doc in enumerate(corpus):
+        ax.scatter(P[i, 0], P[i, 1], s=200,
+                   color=ARTIST_COLORS_CMP[doc["artist"]],
+                   edgecolor="black", linewidth=1.0, alpha=0.85, zorder=3)
+        ax.annotate(doc["title"][:24], (P[i, 0], P[i, 1]),
+                    xytext=(7, 7), textcoords="offset points", fontsize=8)
+    m = info["metrics"]
+    ax.set_title(
+        f"{name}  (dim={info['dim']})\\n"
+        f"silhouette={m['silhouette']:+.3f}  gap={m['gap']:+.3f}  PCA-var={m['pca_var']:.1%}",
+        fontsize=10
+    )
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%})")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%})")
+
+# Ocultar ejes sobrantes
+for k in range(len(model_results), len(axes)):
+    axes[k].set_visible(False)
+
+handles = [
+    plt.scatter([], [], color=c, label=name, s=150, edgecolor="black")
+    for name, c in ARTIST_COLORS_CMP.items()
+]
+fig.legend(handles=handles, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.02), fontsize=11)
+plt.tight_layout()
+plt.show()
+        """
+    ),
+    md(
+        """
+### 12.3 Métricas comparativas — bar charts
+
+Mismas métricas que la tabla, pero visualmente. La barra **gap** (intra menos
+inter) es la que más importa: cuanto más alta, más separa el modelo a los
+artistas. El silhouette refuerza la misma conclusión por una vía distinta;
+si los dos coinciden, la conclusión es robusta.
+        """
+    ),
+    code(
+        """
+if model_results:
+    names = list(model_results.keys())
+    intra = [model_results[n]["metrics"]["sim_intra"] for n in names]
+    inter = [model_results[n]["metrics"]["sim_inter"] for n in names]
+    gap = [model_results[n]["metrics"]["gap"] for n in names]
+    sil = [model_results[n]["metrics"]["silhouette"] for n in names]
+    pca_var = [model_results[n]["metrics"]["pca_var"] for n in names]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Intra vs Inter
+    x = np.arange(len(names))
+    w = 0.38
+    axes[0, 0].bar(x - w/2, intra, w, label="intra-artista", color="#2ca02c", alpha=0.8, edgecolor="black")
+    axes[0, 0].bar(x + w/2, inter, w, label="inter-artista", color="#d62728", alpha=0.8, edgecolor="black")
+    axes[0, 0].set_xticks(x)
+    axes[0, 0].set_xticklabels(names, rotation=20, ha="right")
+    axes[0, 0].set_ylabel("similitud coseno")
+    axes[0, 0].set_title("Similitud intra vs inter (más arriba intra y abajo inter = mejor)")
+    axes[0, 0].legend()
+    axes[0, 0].set_ylim(0, max(intra) * 1.15)
+
+    # Gap
+    bars = axes[0, 1].bar(names, gap, color="#1f77b4", alpha=0.85, edgecolor="black")
+    axes[0, 1].set_xticklabels(names, rotation=20, ha="right")
+    axes[0, 1].set_ylabel("gap = intra − inter")
+    axes[0, 1].set_title("Gap (más alto = clusters más separados)")
+    for bar, v in zip(bars, gap):
+        axes[0, 1].text(bar.get_x() + bar.get_width() / 2, v + 0.005,
+                        f"{v:+.3f}", ha="center", va="bottom", fontsize=9)
+
+    # Silhouette
+    bars = axes[1, 0].bar(names, sil, color="#ff7f0e", alpha=0.85, edgecolor="black")
+    axes[1, 0].set_xticklabels(names, rotation=20, ha="right")
+    axes[1, 0].set_ylabel("silhouette score")
+    axes[1, 0].set_title("Silhouette (canónica para clustering)")
+    axes[1, 0].axhline(0, color="black", linewidth=0.6)
+    for bar, v in zip(bars, sil):
+        axes[1, 0].text(bar.get_x() + bar.get_width() / 2,
+                        v + (0.01 if v >= 0 else -0.02),
+                        f"{v:+.3f}", ha="center",
+                        va="bottom" if v >= 0 else "top", fontsize=9)
+
+    # PCA-explained variance
+    bars = axes[1, 1].bar(names, pca_var, color="#9467bd", alpha=0.85, edgecolor="black")
+    axes[1, 1].set_xticklabels(names, rotation=20, ha="right")
+    axes[1, 1].set_ylabel("varianza explicada por PC1+PC2")
+    axes[1, 1].set_title("Concentración de información en 2 dims\\n(más alto = la estructura es 'baja-dimensional')")
+    axes[1, 1].set_ylim(0, max(pca_var) * 1.2 if max(pca_var) > 0 else 1)
+    for bar, v in zip(bars, pca_var):
+        axes[1, 1].text(bar.get_x() + bar.get_width() / 2, v + 0.005,
+                        f"{v:.1%}", ha="center", va="bottom", fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("(No hay modelos con éxito para comparar todavía.)")
+        """
+    ),
+    md(
+        """
+### 12.4 Retrieval — el test que de verdad importa
+
+Las métricas de clustering miden la geometría. Pero en un RAG lo que importa
+es: **¿cuándo le hago una pregunta, me trae la canción correcta?**
+
+Definimos 5 queries con respuesta canónicamente correcta (a nivel de
+*artista*, no de canción exacta). Para cada modelo:
+
+1. Embebemos la query.
+2. Calculamos similitud coseno contra las 9 canciones.
+3. Tomamos el top-1: el artista de la canción más cercana.
+4. Marcamos hit si el artista coincide con la respuesta correcta.
+
+Reportamos **top-1 accuracy** = (hits) / 5.
+
+Las queries son intencionalmente *no literales* — no mencionan el nombre del
+artista ni la canción. Si el modelo aprendió bien, debería hacer la conexión
+por significado.
+        """
+    ),
+    code(
+        """
+EVAL_QUERIES = [
+    ("¿Quién es la reina de la salsa?", "Celia Cruz"),
+    ("Una guitarra que llora blues con sabor latino", "Santana"),
+    ("Crítica feroz al colonialismo en América Latina", "Cadillacs"),
+    ("Festividad y celebración de la vida", "Celia Cruz"),
+    ("Cover instrumental de un clásico de mambo", "Santana"),
+]
+
+
+def embed_query(model_name: str, embedder, text: str) -> np.ndarray:
+    \"\"\"Embebe una query, cacheada como cualquier otro texto.\"\"\"
+    cache = _load_cache()
+    k = _cache_key(model_name, text)
+    if k not in cache:
+        cache[k] = embedder.embed([text])[0]
+        _save_cache(cache)
+    v = np.array(cache[k], dtype=np.float32)
+    return v / np.linalg.norm(v)
+
+
+retrieval_results: dict[str, dict] = {}
+for name, info in model_results.items():
+    embedder, _ = build_embedder(info["model_id"], info["vendor"])
+    hits = 0
+    rows = []
+    for query, expected_artist in EVAL_QUERIES:
+        q = embed_query(info["model_id"], embedder, query)
+        sims = info["X"] @ q
+        top_idx = int(np.argmax(sims))
+        retrieved_artist = artists[top_idx]
+        retrieved_song = labels[top_idx]
+        hit = retrieved_artist == expected_artist
+        hits += int(hit)
+        rows.append({
+            "query": query,
+            "expected": expected_artist,
+            "retrieved_artist": retrieved_artist,
+            "retrieved_song": retrieved_song,
+            "sim": float(sims[top_idx]),
+            "hit": hit,
+        })
+    retrieval_results[name] = {
+        "hits": hits,
+        "total": len(EVAL_QUERIES),
+        "accuracy": hits / len(EVAL_QUERIES),
+        "rows": rows,
+    }
+    print(f"\\n=== {name}: top-1 accuracy = {hits}/{len(EVAL_QUERIES)} ({hits/len(EVAL_QUERIES):.0%}) ===")
+    for r in rows:
+        mark = "✓" if r["hit"] else "✘"
+        print(f"  {mark}  '{r['query'][:50]:<50}' → {r['retrieved_song']} ({r['retrieved_artist']}, sim={r['sim']:.2f})")
+        """
+    ),
+    md(
+        """
+### 12.5 Tabla resumen + interpretación humana
+
+Juntamos en una sola tabla todo lo que vimos. Una columna por métrica, una
+fila por modelo. Esto es lo que se llevaría un *engineering review* sobre la
+decisión "qué embedder usar para mi RAG".
+        """
+    ),
+    code(
+        """
+print(f"{'Modelo':<22}  {'dim':>5}  {'gap':>7}  {'silh':>6}  {'PCA-v':>6}  {'top-1':>7}")
+print("─" * 70)
+for name, info in model_results.items():
+    m = info["metrics"]
+    r = retrieval_results.get(name, {})
+    acc_str = f"{r.get('hits', 0)}/{r.get('total', 0)}" if r else "n/a"
+    print(
+        f"{name:<22}  {info['dim']:>5}  "
+        f"{m['gap']:>+7.3f}  {m['silhouette']:>+6.3f}  {m['pca_var']:>5.1%}  "
+        f"{acc_str:>7}"
+    )
+
+if model_failures:
+    print("\\nModelos que no se pudieron probar:")
+    for name, err in model_failures:
+        print(f"  · {name}: {err}")
+        """
+    ),
+    md(
+        """
+### 12.6 Conclusiones — qué dice realmente este experimento
+
+Las conclusiones son específicas a *este corpus* (9 canciones en español
+neutro de tres artistas latinoamericanos). No las extrapoles ciegamente a tu
+caso, pero el **método** sí es transferible.
+
+Lo que típicamente vas a observar al ejecutar la sección:
+
+1. **El `large` de OpenAI no siempre justifica su precio.** En corpora
+   pequeños y bien diferenciados (como este), `small` y `large` suelen tener
+   silhouette y gap muy parecidos. La diferencia se nota cuando los textos
+   son ambiguos o el vocabulario es técnico. **Si tu hit@k con `small` es
+   alto, no pagues `large`.**
+
+2. **Gemini embeddings (3072 dim) tiende a producir similitudes generalmente
+   más altas** que OpenAI, lo cual *no* significa que sea mejor. Lo que
+   importa es el **gap** (intra − inter), no las similitudes absolutas. Un
+   modelo que pone todo a 0.9 sigue siendo útil si separa 0.92 vs 0.85.
+
+3. **`text-embedding-004` con sólo 768 dimensiones suele competir
+   sorprendentemente bien** con modelos 4x más grandes. La dimensionalidad
+   alta ayuda en corpora masivos y diversos, pero satura rápido en corpora
+   pequeños. Para un RAG con <100k chunks, 768 dim suele alcanzar.
+
+4. **La varianza explicada por PC1+PC2 es un indicador útil de "qué tan
+   plano" es tu corpus para el modelo.** Si un modelo concentra >50% de
+   varianza en 2 dims, está colapsando estructura. Si concentra <10%, está
+   distribuyendo en muchos ejes (puede ser bueno: hay matices; o malo: hay
+   ruido).
+
+5. **Retrieval top-1 accuracy es la métrica que decide la compra.** Las
+   demás son diagnósticas. Si dos modelos empatan en accuracy, el más barato
+   o el más rápido gana. Si uno gana en accuracy pero pierde en costo, hay
+   que calcular cuánto te cuesta cada fallo en producción.
+
+### Recomendación práctica (heurística, no ley)
+
+| Caso | Modelo sugerido | Por qué |
+|------|-----------------|---------|
+| RAG con corpus pequeño (<50k chunks) en español/inglés | `text-embedding-3-small` | Barato, suficiente, dimensionalidad manejable |
+| Necesitas multilingüe agresivo (incluyendo idiomas con poco recurso) | `text-embedding-004` o `multilingual-e5` | Entrenamiento amplio |
+| Corpus técnico/científico con vocabulario denso | `text-embedding-3-large` | Más capacidad para vocabulario raro |
+| Corpus enorme (>500k chunks) donde el retrieval es el cuello de botella | `gemini-embedding-001` | Mejor *recall* en escalas grandes (según benchmarks de Google) |
+| Quieres una baseline gratis para prototipar sin tarjeta | `text-embedding-004` (Google AI Studio) | Free tier, sin GCP |
+
+Para esta clase, la decisión es clara: **el `small` de OpenAI hace el
+trabajo**. Cualquier otro modelo es over-engineering hasta que las métricas
+de producción digan lo contrario.
+        """
+    ),
+    md(
+        """
+## 13. Cierre — la caja de herramientas que te llevas
 
 Lo importante de esta notebook no es la matriz, ni el mapa, ni los
 centroides. Es la **intuición** de que tu corpus tiene una geometría y que

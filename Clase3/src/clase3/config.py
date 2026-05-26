@@ -25,6 +25,15 @@ def get_env(key: str, default: str | None = None, *, required: bool = False) -> 
 # ── API keys ──────────────────────────────────────────────────────────────────
 OPENAI_API_KEY: str = get_env("OPENAI_API_KEY", required=True)  # type: ignore[assignment]
 
+# Google API key (opcional): se acepta cualquiera de las tres convenciones de
+# nombre comunes — la primera no vacía gana. Si no está configurada, los
+# adapters de Google no se podrán construir, pero el resto del paquete funciona.
+GCP_API_KEY: str | None = (
+    get_env("GCP_API_KEY")
+    or get_env("GOOGLE_API_KEY")
+    or get_env("GEMINI_API_KEY")
+)
+
 # ── Rutas ─────────────────────────────────────────────────────────────────────
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 DATA_DIR: Path = PROJECT_ROOT / "data"
