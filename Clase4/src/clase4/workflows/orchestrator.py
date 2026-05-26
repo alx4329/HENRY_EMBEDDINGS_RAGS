@@ -105,6 +105,13 @@ class OrchestratorWorkflow:
         self._llm = llm
         self._worker = WorkerAgent(llm)
 
+    _FALLBACK_TASKS: ClassVar[list[SubTask]] = [
+        SubTask(type="datos", description="Datos básicos (artista, año, sello, género)."),
+        SubTask(type="contexto", description="Contexto histórico de la obra."),
+        SubTask(type="musical", description="Análisis musical y arreglos."),
+        SubTask(type="legado", description="Legado e influencia cultural."),
+    ]
+
     def _decompose(self, topic: str) -> tuple[str, list[SubTask]]:
         messages = [
             SystemMessage(content=ORCHESTRATOR_PROMPT),
@@ -113,12 +120,17 @@ class OrchestratorWorkflow:
         raw = self._llm.chat(messages, temperature=0.2).content
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
-            raise ValueError(f"El orquestador no devolvió JSON válido:\n{raw}")
-        payload = json.loads(match.group(0))
+            return "(plan por defecto: el orquestador no devolvió JSON parseable)", list(
+                self._FALLBACK_TASKS
+            )
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return "(plan por defecto: JSON inválido)", list(self._FALLBACK_TASKS)
         tasks = [
             SubTask(type=str(t.get("type", "datos")), description=str(t.get("description", "")))
             for t in payload.get("tasks", [])
-        ]
+        ] or list(self._FALLBACK_TASKS)
         return payload.get("analysis", ""), tasks
 
     def _synthesize(self, topic: str, partials: list[tuple[SubTask, str]]) -> str:

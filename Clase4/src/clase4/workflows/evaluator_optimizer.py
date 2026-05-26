@@ -68,8 +68,18 @@ class ReviewEvaluator:
             UserMessage(content=review),
         ]
         verdict = self._llm.chat(messages, temperature=0.0).content
-        approved = "APROBADO" in verdict.upper().split("VEREDICTO:")[-1]
+        approved = self._parse_verdict(verdict)
         return approved, verdict
+
+    @staticmethod
+    def _parse_verdict(verdict: str) -> bool:
+        """Parsea el veredicto buscando línea ``VEREDICTO:`` y leyendo el token."""
+        for raw_line in verdict.splitlines():
+            line = raw_line.strip().upper()
+            if line.startswith("VEREDICTO:"):
+                tokens = line.split(":", 1)[1].strip().split()
+                return bool(tokens) and tokens[0] == "APROBADO"
+        return False
 
 
 class EvaluatorOptimizerWorkflow:
