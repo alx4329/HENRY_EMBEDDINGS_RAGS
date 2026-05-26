@@ -41,7 +41,7 @@ class _FakeStore:
         self._chunks.extend(chunks)
 
     def query(
-        self, query_text: str, top_k: int = 3, where=None  # noqa: ARG002
+        self, query_text: str, top_k: int = 3, where=None
     ) -> list[RetrievedChunk]:
         scored = [
             (

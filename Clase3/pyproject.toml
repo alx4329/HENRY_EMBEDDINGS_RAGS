@@ -17,12 +17,17 @@ dev = [
     "ruff>=0.6.9",
     "pytest>=8.0.0",
     "ipykernel>=7.0.0",
+    # Notebook de visualización de embeddings (notebooks/01_embeddings_visual_tour.ipynb)
+    "matplotlib>=3.8.0",
+    "scikit-learn>=1.5.0",
+    "nbformat>=5.10.0",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 src = ["src", "scripts"]
+extend-exclude = ["notebooks/*.ipynb"]  # los notebooks no se lintean
 
 [tool.ruff.lint]
 select = [
@@ -43,6 +48,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/*" = ["E402"]  # module level import not at top of file
+"notebooks/_build_notebook.py" = ["RUF001"]  # signos matemáticos Unicode en prosa
 
 [tool.ruff.format]
 quote-style = "double"

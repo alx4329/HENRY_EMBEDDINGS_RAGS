@@ -6,20 +6,25 @@ resultados.
 
 Caso: dado un álbum o canción, el orquestador descompone la solicitud en
 sub-tareas (datos básicos, contexto histórico, análisis musical, recepción
-crítica). Cada worker resuelve su sub-tarea. Un agente final sintetiza
-todo en un *long-form essay*.
+crítica). Cada worker resuelve su sub-tarea **en paralelo** (las llamadas a
+la API liberan el GIL durante el I/O). Un agente final sintetiza todo en
+un *long-form essay*.
 
 Esto demuestra:
 - **Decomposition**: el orquestador convierte una solicitud difusa en
   trabajo paralelizable.
 - **Open/Closed**: añadir un nuevo tipo de worker (ej. ``analisis_lirico``)
-  no requiere tocar al orquestador.
+  no requiere tocar al orquestador — basta extender el diccionario de
+  prompts del ``WorkerAgent``.
+- **Robustez**: si el planner LLM devuelve JSON inválido se aplica
+  ``_FALLBACK_TASKS`` para no perder la ejecución.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -101,9 +106,10 @@ class WorkerAgent:
 class OrchestratorWorkflow:
     name = "orchestrator"
 
-    def __init__(self, llm: LLMClient) -> None:
+    def __init__(self, llm: LLMClient, *, max_workers: int = 4) -> None:
         self._llm = llm
         self._worker = WorkerAgent(llm)
+        self._max_workers = max_workers
 
     _FALLBACK_TASKS: ClassVar[list[SubTask]] = [
         SubTask(type="datos", description="Datos básicos (artista, año, sello, género)."),
@@ -144,16 +150,31 @@ class OrchestratorWorkflow:
         ]
         return self._llm.chat(messages, temperature=0.5).content
 
+    def _run_workers(self, user_input: str, tasks: list[SubTask]) -> list[tuple[SubTask, str]]:
+        """Ejecuta los workers en paralelo y preserva el orden original.
+
+        Las llamadas a la API liberan el GIL durante el I/O, así que un
+        ``ThreadPoolExecutor`` reduce la latencia de N llamadas secuenciales
+        a aproximadamente la latencia de la más lenta.
+        """
+        outputs: list[str | None] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            future_to_idx = {
+                executor.submit(self._worker.run, user_input, task): idx
+                for idx, task in enumerate(tasks)
+            }
+            for future in future_to_idx:
+                outputs[future_to_idx[future]] = future.result()
+        return [(task, outputs[idx] or "") for idx, task in enumerate(tasks)]
+
     def run(self, user_input: str) -> WorkflowResult:
         analysis, tasks = self._decompose(user_input)
         steps: list[WorkflowStep] = [
             WorkflowStep(name="orchestrator", output={"analysis": analysis, "tasks": tasks}),
         ]
 
-        partials: list[tuple[SubTask, str]] = []
-        for task in tasks:
-            output = self._worker.run(user_input, task)
-            partials.append((task, output))
+        partials = self._run_workers(user_input, tasks)
+        for task, output in partials:
             steps.append(WorkflowStep(name=f"worker_{task.type}", output=output))
 
         final = self._synthesize(user_input, partials)

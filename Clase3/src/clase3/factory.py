@@ -23,6 +23,7 @@ from clase3.config import (
     DEFAULT_TOP_K,
     OPENAI_API_KEY,
 )
+from clase3.ports.vector_store import VectorStore
 from clase3.services.augmenter import DEFAULT_SYSTEM_PROMPT, PromptAugmenter
 from clase3.services.chunker import TextChunker
 from clase3.services.generator import AnswerGenerator
@@ -33,12 +34,18 @@ from clase3.services.retriever import Retriever
 
 @dataclass
 class RAGBundle:
-    """Conjunto cohesivo de componentes para un dominio (cómics, música…)."""
+    """Conjunto cohesivo de componentes para un dominio (cómics, música…).
+
+    El campo ``store`` se tipa contra el Protocol ``VectorStore`` y no contra
+    la implementación concreta de Chroma: esto es Dependency Inversion en
+    acción. Cualquier código que reciba un ``RAGBundle`` puede llamar a
+    ``store.count()`` / ``store.query(...)`` sin acoplarse al proveedor.
+    """
 
     name: str
     pipeline: RAGPipeline
     indexer: CorpusIndexer
-    store: ChromaVectorStore
+    store: VectorStore
 
 
 def build_rag_bundle(

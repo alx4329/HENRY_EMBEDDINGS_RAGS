@@ -7,6 +7,27 @@
 
 ---
 
+## 0. Descripción ejecutiva
+
+Este módulo implementa un sistema **RAG (Retrieval-Augmented Generation)
+modular** con arquitectura hexagonal (domain · ports · adapters · services
+· factory). El pipeline canónico **R-A-G** se descompone en servicios
+independientes que se conectan por inyección de dependencias: cambiar el
+vector store, el embedder o el LLM no toca el resto del código.
+
+| Capa | Responsabilidad | Sabe de Chroma/OpenAI |
+|------|-----------------|------------------------|
+| `domain/` | DTOs inmutables (`Document`, `Chunk`, `RetrievedChunk`, mensajes) | ❌ |
+| `ports/` | Protocols (`DocumentLoader`, `EmbeddingProvider`, `VectorStore`, `LLMClient`) | ❌ |
+| `services/` | Lógica de negocio: chunker, retriever, augmenter, generator, pipeline, indexer | ❌ |
+| `adapters/` | Implementaciones concretas (`MarkdownDirectoryLoader`, `OpenAIEmbedder`, `ChromaVectorStore`, `OpenAIChatClient`) | ✅ |
+| `factory.py` | Composition root (`build_rag_bundle`) — único lugar que importa adapters | ✅ |
+
+Verificable: **15 tests pasan sin red** (chunker, loader, augmenter,
+integración con fakes que cumplen los Protocols).
+
+---
+
 ## 1. ¿Qué es RAG y por qué importa?
 
 Un modelo de lenguaje (LLM) sólo "sabe" lo que vio durante su entrenamiento.
@@ -70,6 +91,11 @@ Clase3/
 │   ├── exercise_03_musical_rag.py
 │   ├── exercise_04_router_rag.py
 │   └── exercise_05_evaluate.py
+├── notebooks/
+│   ├── 01_embeddings_visual_tour.ipynb   # tour visual: PCA, t-SNE, heatmap,
+│   │                                     # centroides, chunking — todo
+│   │                                     # explicado en estilo profesor
+│   └── _build_notebook.py                # regenera la notebook desde código
 ├── tests/               # 15 unit + integration tests (sin red)
 └── pyproject.toml       # uv + ruff + pytest
 ```
@@ -126,13 +152,35 @@ Los chunks se construyen respetando los encabezados H2 del Markdown.
 Requiere **Python 3.11+**, [`uv`](https://github.com/astral-sh/uv) y un
 `.env` con `OPENAI_API_KEY` en la raíz del repositorio (`HENRY_EMBEDDINGS_RAGS/.env`).
 
+### macOS / Linux
+
 ```bash
+# 1) Instalar uv (si aún no lo tienes)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2) Sincronizar dependencias
 cd Clase3
 uv sync                # instala dependencias y crea .venv
 ```
 
-Eso es todo. `uv` se encarga del entorno virtual, lockfile y resolución
-determinista.
+### Windows (PowerShell)
+
+```powershell
+# 1) Instalar uv (si aún no lo tienes)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# 2) Sincronizar dependencias
+cd Clase3
+uv sync                # crea .venv\ y resuelve wheels de win_amd64
+```
+
+`uv` se encarga del entorno virtual, lockfile y resolución determinista.
+**El mismo `uv.lock` resuelve correctamente en Mac (arm64/x86_64) y Windows
+(amd64/arm64)** — todas las dependencias (`chromadb`, `onnxruntime`,
+`scikit-learn`, etc.) tienen wheels para ambas plataformas.
+
+> En **Windows ARM** (Snapdragon) verifica que estés en Python ≥ 3.11 nativo
+> arm64; los wheels `cp311-win_arm64` están disponibles en el lock.
 
 ---
 
@@ -146,6 +194,7 @@ uv run python scripts/exercise_01_ingest.py --reset
 uv run python scripts/exercise_02_basic_rag.py
 
 # 3) RAG musical (system prompt: crítico musical latinoamericano)
+#    Imprime también una tabla de retrieval por pregunta (título · sección · sim).
 uv run python scripts/exercise_03_musical_rag.py
 
 # 4) Router RAG: el LLM decide entre 'comics' y 'musica'
@@ -154,6 +203,73 @@ uv run python scripts/exercise_04_router_rag.py
 # 5) Evaluación cuantitativa (hit@k, MRR, similitud media)
 uv run python scripts/exercise_05_evaluate.py
 ```
+
+### 5.1 Notebook — *Geometría del significado*
+
+`notebooks/01_embeddings_visual_tour.ipynb` es un tour visual estilo *Jay
+Alammar* sobre el espacio de embeddings, construido **sobre el mismo corpus
+musical** que usa el RAG. Cada visualización está atada a un caso de uso de
+RAG real:
+
+| Sección | Pregunta que responde | Conexión con RAG |
+|---------|----------------------|-------------------|
+| Anatomía del vector | ¿Norma 1? ¿Distribución? | Validar la promesa del proveedor de embeddings |
+| Heatmap de similitud | ¿El modelo agrupa por estilo? | Diagnóstico de overlap entre corpora |
+| PCA + t-SNE | ¿Cómo se ve el "mapa" del corpus? | Auditoría del espacio antes de tunear prompts |
+| k-NN a mano | ¿Qué hace `Retriever.retrieve`? | Simulación del paso "R" del pipeline |
+| Centroides por artista | ¿Qué tan separados están los estilos? | Base de routers semánticos sin LLM |
+| Aritmética de vectores | ¿Existen ejes culturales? | Soft-routing sin metadata |
+| Chunking visual | ¿Los chunks orbitan al documento? | Diagnóstico del chunker |
+
+**Setup (una sola vez):** registra el venv como kernel de Jupyter para que
+aparezca en el selector de Jupyter/VS Code/Antigravity.
+
+**macOS / Linux:**
+
+```bash
+cd Clase3
+uv sync
+uv run python -m ipykernel install --user \
+    --name=clase3-henry \
+    --display-name="Python (Clase 3 · RAG)"
+```
+
+**Windows (PowerShell):**
+
+```powershell
+cd Clase3
+uv sync
+uv run python -m ipykernel install --user `
+    --name=clase3-henry `
+    --display-name="Python (Clase 3 · RAG)"
+```
+
+> En **Windows** las kernel-specs se instalan automáticamente en
+> `%APPDATA%\jupyter\kernels\clase3-henry\`. En **macOS** van a
+> `~/Library/Jupyter/kernels/clase3-henry/`. El flag `--user` se encarga de
+> elegir el directorio correcto por plataforma.
+
+**Abrir la notebook:**
+
+```bash
+uv run jupyter lab notebooks/01_embeddings_visual_tour.ipynb
+#  o
+uv run jupyter notebook notebooks/01_embeddings_visual_tour.ipynb
+```
+
+Arriba a la derecha debe decir **"Python (Clase 3 · RAG)"**. Si aparece
+"Python 3" genérico, cámbialo desde el menú *Kernel → Change Kernel*. La
+primera celda de código valida que el setup está correcto antes de ejecutar
+nada que cueste dinero.
+
+Los embeddings se cachean en `.cache/music_embeddings.pkl` (hash por
+contenido), así que re-ejecutar la notebook es gratis.
+
+> Para Clase 4 hay un kernel equivalente disponible si lo necesitas:
+> ```bash
+> cd Clase4
+> uv run python -m ipykernel install --user --name=clase4-henry --display-name="Python (Clase 4 · Workflows)"
+> ```
 
 ### Calidad de código
 

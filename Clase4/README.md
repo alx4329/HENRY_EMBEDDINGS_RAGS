@@ -8,6 +8,25 @@
 
 ---
 
+## 0. Descripción ejecutiva
+
+Este módulo implementa **cinco patrones canónicos** de orquestación
+agenticos con una **arquitectura hexagonal limpia** (domain · ports ·
+adapters · workflows · factory). Cada workflow vive en su propio archivo,
+depende sólo de Protocols (no de OpenAI), y se inyecta como dependencia.
+Esto permite testear los cinco patrones sin red (15 tests, ~0.2 s) y
+sustituir el proveedor LLM con un adapter sin tocar la lógica.
+
+| Capa | Responsabilidad | Sabe de OpenAI |
+|------|-----------------|----------------|
+| `domain/` | DTOs (mensajes, `WorkflowResult`, `WorkflowStep`) | ❌ |
+| `ports/` | Protocols (`LLMClient`, `Workflow`) | ❌ |
+| `workflows/` | Los 5 patrones — pura orquestación | ❌ |
+| `adapters/` | Implementaciones concretas (`OpenAIChatClient`) | ✅ |
+| `factory.py` | Composition root (único lugar) | ✅ |
+
+---
+
 ## 1. ¿Qué es un workflow agenticos?
 
 Mientras que un único prompt es estático y monolítico, un **workflow** es
@@ -67,9 +86,10 @@ escritor en la siguiente iteración. Stopping condition: ``max_retries``.
 
 Un editor jefe (LLM) **descompone** un álbum en sub-tareas tipadas
 (`datos`, `contexto`, `musical`, `recepcion`, `legado`). Cada sub-tarea va
-a un worker especializado. Un editor de cierre **sintetiza** todo en un
-ensayo largo. Si el JSON del planner es inválido, se aplica un fallback
-con un plan por defecto.
+a un worker especializado y los workers corren **en paralelo** con
+``ThreadPoolExecutor`` (el GIL se libera durante el I/O de la API). Un
+editor de cierre **sintetiza** todo en un ensayo largo. Si el JSON del
+planner es inválido, se aplica un fallback con un plan por defecto.
 
 ---
 
@@ -85,7 +105,7 @@ Clase4/
 │   ├── workflows/       # los 5 patrones, cada uno aislado y testeable
 │   └── factory.py       # composition root: build_llm + build_all_workflows
 ├── scripts/             # ejercicios end-to-end ejecutables con `uv run`
-└── tests/               # 14 tests con FakeLLM (sin red)
+└── tests/               # 15 tests con FakeLLM (sin red)
 ```
 
 | Principio | Aplicación en Clase 4 |
@@ -104,10 +124,30 @@ Requiere Python 3.11+ y [`uv`](https://github.com/astral-sh/uv). El
 `.env` con `OPENAI_API_KEY` debe estar en la raíz del repo
 (`HENRY_EMBEDDINGS_RAGS/.env`, ya existente).
 
+### macOS / Linux
+
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # si no tienes uv
 cd Clase4
 uv sync
 ```
+
+### Windows (PowerShell)
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"   # si no tienes uv
+cd Clase4
+uv sync
+```
+
+El `uv.lock` resuelve wheels para **macOS (arm64/x86_64) y Windows
+(amd64/arm64)** — el comando es idéntico en ambas plataformas.
+
+> **Si quieres registrar un kernel de Jupyter para hacer notebooks dentro de
+> Clase 4:**
+> ```bash
+> uv run python -m ipykernel install --user --name=clase4-henry --display-name="Python (Clase 4 · Workflows)"
+> ```
 
 ---
 
@@ -125,7 +165,7 @@ uv run python scripts/exercise_05_orchestrator.py
 
 ```bash
 uv run ruff check src scripts tests
-uv run pytest tests/ -v             # 14 tests, ~0.05s, sin red
+uv run pytest tests/ -v             # 15 tests, ~0.2s, sin red
 ```
 
 ---
@@ -193,12 +233,21 @@ for attempt in range(1, self._max_retries + 1):
     feedback = verdict
 ```
 
-### Orchestrator (planner + workers + synthesizer)
+### Orchestrator (planner + workers paralelos + synthesizer)
 
 ```python
-analysis, tasks = self._decompose(user_input)         # JSON con sub-tareas
-partials = [(t, self._worker.run(user_input, t)) for t in tasks]
-final    = self._synthesize(user_input, partials)
+analysis, tasks = self._decompose(user_input)          # JSON con sub-tareas
+partials = self._run_workers(user_input, tasks)        # ThreadPoolExecutor
+final    = self._synthesize(user_input, partials)      # ensayo final
+
+# _run_workers preserva el orden original aunque los futures terminen
+# en orden distinto:
+outputs: list[str | None] = [None] * len(tasks)
+with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+    future_to_idx = {executor.submit(self._worker.run, user_input, t): i
+                     for i, t in enumerate(tasks)}
+    for future in future_to_idx:
+        outputs[future_to_idx[future]] = future.result()
 ```
 
 ---
@@ -209,7 +258,8 @@ final    = self._synthesize(user_input, partials)
 |-------|-------------|--------|
 | **1** | Implementación base. Todos los workflows ejecutan con OpenAI real. | 11 tests unitarios con `ScriptedLLM`. |
 | **2** | `evaluator._parse_verdict` usaba `"APROBADO" in ...` (frágil); el orquestador no tenía fallback ante JSON malformado. | Parser por línea ``VEREDICTO:`` con token check. Fallback ``_FALLBACK_TASKS`` con plan por defecto. |
-| **3** | Faltaban tests para ruido en el veredicto, ausencia de cabecera y JSON inválido. | +3 tests de robustez (total **14**). Verificación final: ``ruff`` limpio, todos los workflows ejecutan end-to-end. |
+| **3** | Faltaban tests para ruido en el veredicto, ausencia de cabecera y JSON inválido. | +3 tests de robustez. Verificación con ``ruff`` limpio y todos los workflows ejecutan end-to-end. |
+| **4** | Los workers del Orchestrator corrían secuencialmente, desperdiciando el patrón paralelizable. ``factory.build_all_workflows`` retornaba ``dict[str, object]`` (tipado débil). | ``OrchestratorWorkflow._run_workers`` usa ``ThreadPoolExecutor`` preservando orden; ``RAGBundle.store`` y ``build_all_workflows`` se tipan contra los Protocols (``VectorStore`` / ``Workflow``). Total **15 tests** incluyendo verificación de paralelismo. |
 
 ---
 

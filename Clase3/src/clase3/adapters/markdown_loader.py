@@ -52,8 +52,8 @@ class MarkdownDirectoryLoader:
 
     @staticmethod
     def _extract_title(content: str) -> str | None:
-        for line in content.splitlines():
-            line = line.strip()
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
             if line.startswith("# "):
                 return line.lstrip("# ").strip()
         return None
