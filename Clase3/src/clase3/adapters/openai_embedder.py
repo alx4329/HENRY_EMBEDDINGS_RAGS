@@ -7,8 +7,7 @@ from openai import OpenAI
 # Dimensiones conocidas de los modelos de embeddings de OpenAI.
 _DIMENSIONS: dict[str, int] = {
     "text-embedding-3-small": 1536,
-    "text-embedding-3-large": 3072,
-    "text-embedding-ada-002": 1536,
+    "text-embedding-3-large": 3072
 }
 
 

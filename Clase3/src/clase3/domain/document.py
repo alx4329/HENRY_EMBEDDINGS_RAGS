@@ -4,7 +4,9 @@ Estas clases son DTOs puros: no conocen ningún detalle de OpenAI, ChromaDB o
 disco. Permiten que el resto del pipeline trabaje con tipos estables sin
 acoplarse a un proveedor concreto (Principio de Inversión de Dependencias).
 """
-
+#=====================#
+# ---- Library -------#
+#=====================#
 from __future__ import annotations
 
 import uuid
